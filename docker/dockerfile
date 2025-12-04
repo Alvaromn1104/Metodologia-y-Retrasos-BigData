@@ -1,0 +1,11 @@
+# Usamos una imagen oficial de Python ligera
+FROM python:3.9-slim
+
+# Instalamos Apache Beam con los componentes para correr sobre Flink
+RUN pip install --no-cache-dir apache-beam[gcp,interactive,test]
+
+# Creamos directorio de trabajo
+WORKDIR /app
+
+# El contenedor se quedará esperando (para que no se cierre y podamos lanzar comandos)
+CMD ["tail", "-f", "/dev/null"]
