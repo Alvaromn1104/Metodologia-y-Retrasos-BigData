@@ -52,3 +52,21 @@ services:
     depends_on:
       - jobmanager
       - kafka
+  # --- 4. ALMACENAMIENTO SPEED LAYER (MongoDB) ---
+  mongo:
+    image: mongo:latest
+    container_name: mongodb
+    command: ["--auth"] 
+    ports:
+      - "27017:27017" # Exponemos el puerto para que Power BI (Miembro 1) pueda conectar
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=example
+    volumes:
+      - mongo-data:/data/db # Para no perder datos si reinicias
+    networks:
+      - default
+
+volumes:
+  mongo-data:
+
