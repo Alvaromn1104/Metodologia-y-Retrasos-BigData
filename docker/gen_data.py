@@ -6,45 +6,62 @@ import random
 BROKERS = ['kafka:9093']
 producer = KafkaProducer(bootstrap_servers=BROKERS, value_serializer=lambda v: json.dumps(v).encode('utf-8'))
 
-aeropuertos = ["MAD", "BCN", "JFK", "LHR"]
-climas = ["CLEAR", "RAIN", "STORM", "SNOW", "CLOUDY"]
+# Datos para simulación
+CIUDADES_CLIMA = [
+    {"name": "Sol", "airport_icao": "LEMD"},      # Madrid
+    {"name": "Atlanta", "airport_icao": "KATL"},  # Atlanta
+    {"name": "London", "airport_icao": "EGLL"}    # Londres
+]
 
-print("🌪️ Iniciando SIMULACIÓN TOTAL (Vuelos + Clima + Errores)...")
+CONDICIONES = ["Clouds", "Clear", "Rain", "Thunderstorm", "Snow"]
+
+print("🌪️ Generando datos formato REAL (OpenSky + OpenWeather)...")
 
 for i in range(50):
     
-    # 1. Enviamos actualización de CLIMA (Topic weather_rt_api)
-    # Esto permite probar el JOIN en tiempo real
-    airport_update = random.choice(aeropuertos)
-    weather_event = {
-        "airport": airport_update,
-        "condition": random.choice(climas),
-        "timestamp": time.time()
+    # --- 1. Generar Clima (Formato OpenWeather) ---
+    ciudad = random.choice(CIUDADES_CLIMA)
+    condicion_actual = random.choice(CONDICIONES)
+    
+    weather_payload = {
+        "coord": {"lon": -3.69, "lat": 40.41},
+        "weather": [{"id": 802, "main": condicion_actual, "description": "scattered clouds", "icon": "03d"}],
+        "base": "stations",
+        "main": {"temp": random.uniform(5, 30), "pressure": 1021, "humidity": 67},
+        "visibility": 10000,
+        "dt": int(time.time()),
+        "name": ciudad["name"], # "Sol", "Atlanta"...
+        "cod": 200
     }
-    producer.send('weather_rt_api', weather_event)
-    
-    # 2. Enviamos VUELO (Topic flights_rt_api)
-    airport_flight = random.choice(aeropuertos)
-    delay = random.randint(-10, 150) # Incluye negativos para testear rangos
-    
-    # Introducimos ERRORES A PROPÓSITO para probar Reglas de Calidad
-    flight_id = f"IB-{random.randint(1000, 9999)}"
-    if i % 10 == 0: 
-        flight_id = "" # Error Regla 1: Falta ID
-    if i % 15 == 0:
-        airport_flight = "Madrid" # Error Regla 4: Formato incorrecto (no es IATA)
+    producer.send('weather_rt_api', weather_payload)
 
-    flight_event = {
-        "flight_id": flight_id,
-        "airport": airport_flight,
-        "timestamp": "2025-12-18T12:00:00",
-        "delay_min": delay,
-        "status": "UNK"
+    # --- 2. Generar Vuelo (Formato OpenSky) ---
+    # Nota: Simulamos que NiFi ha añadido 'delay_calculated'
+    retraso = random.randint(-5, 60)
+    
+    # Caso de prueba: Si llueve en Madrid, poner retraso para ver si sale RIESGO ALTO
+    if ciudad["name"] == "Sol" and condicion_actual == "Rain":
+        retraso = 30 
+
+    flight_payload = {
+        "icao24": "ac52ff",
+        "firstSeen": int(time.time()),
+        "estDepartureAirport": ciudad["airport_icao"], # KATL, LEMD...
+        "lastSeen": int(time.time()) + 100,
+        "callsign": f"IBE{random.randint(100,999)} ", # Con espacio al final como el real
+        "estDepartureAirportHorizDistance": 509,
+        "departureAirportCandidatesCount": 317,
+        # ESTE CAMPO LO DEBE AÑADIR NIFI (nosotros lo simulamos aquí)
+        "delay_calculated": retraso 
     }
+
+    # Introducir error de calidad a propósito (callsign vacío)
+    if i % 20 == 0:
+        flight_payload["callsign"] = "" 
+
+    producer.send('flights_rt_api', flight_payload)
     
-    producer.send('flights_rt_api', flight_event)
-    
-    print(f"📡 Enviado Clima ({airport_update}) y Vuelo ({flight_id})")
+    print(f"📡 Enviado: Clima en {ciudad['name']} ({condicion_actual}) | Vuelo desde {ciudad['airport_icao']} (Retraso: {retraso})")
     time.sleep(0.5)
 
 producer.flush()

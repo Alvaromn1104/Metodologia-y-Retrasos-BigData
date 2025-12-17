@@ -6,158 +6,159 @@ import json
 import logging
 import datetime
 import re
+import time
 
 # --- CONFIGURACIÓN ---
 MONGO_URI = "mongodb://root:example@mongo:27017/"
 DB_NAME = "bigdata_project"
 
-# Memoria volátil para el estado del clima (Simulando una tabla de estado en Flink)
-# Se actualiza cuando llegan eventos al topic 'weather_rt_api'
-WEATHER_STATE = {}
+# --- DICCIONARIO DE TRADUCCIÓN (Crucial para el Join) ---
+# OpenWeather nos da nombres de ciudades ("Sol", "Atlanta"), pero OpenSky usa códigos ICAO ("LEMD", "KATL").
+# Este diccionario permite cruzar ambos mundos.
+CITY_TO_ICAO = {
+    "Sol": "LEMD",      # Madrid
+    "Madrid": "LEMD",
+    "Atlanta": "KATL",  # Atlanta Hartsfield-Jackson
+    "London": "EGLL",   # Heathrow
+    "New York": "KJFK"  # JFK
+}
 
-# Contadores para Monitorización [Requisito 6.1]
+# Estado del clima en memoria (Broadcast State)
+WEATHER_STATE = {}
 METRICS = {"processed": 0, "errors": 0, "weather_updates": 0}
 
 class ReadAndJoinKafka(beam.DoFn):
     """
-    Lee de DOS topics a la vez.
-    - Si es clima: Actualiza el estado.
-    - Si es vuelo: Lo emite para procesar.
-    Esto cumple el requisito de JOIN
+    Lee datos RAW de las APIs, los parsea y realiza el JOIN.
     """
     def process(self, element):
-        # Nos suscribimos a ambos topics
-        consumer = KafkaConsumer(
-            'flights_rt_api', 'weather_rt_api',
-            bootstrap_servers=['kafka:9093'], 
-            auto_offset_reset='latest', 
-            group_id='beam_multi_topic_group',
-            value_deserializer=lambda x: x.decode('utf-8')
-        )
-        print("📡 Radar Multicanal Activo (Vuelos + Clima).")
+        consumer = None
+        while consumer is None:
+            try:
+                consumer = KafkaConsumer(
+                    'flights_rt_api', 'weather_rt_api',
+                    bootstrap_servers=['kafka:9093'], 
+                    auto_offset_reset='latest', 
+                    group_id='beam_final_group',
+                    value_deserializer=lambda x: x.decode('utf-8')
+                )
+            except Exception:
+                time.sleep(5)
+
+        print("📡 Escuchando Kafka (Formatos Reales OpenSky/OpenWeather)...")
         
         for message in consumer:
             topic = message.topic
-            payload = json.loads(message.value)
-            
-            if topic == 'weather_rt_api':
-                # Actualizamos el estado del clima (JOIN)
-                airport = payload.get('airport')
-                condition = payload.get('condition')
-                WEATHER_STATE[airport] = condition
-                METRICS["weather_updates"] += 1
-                # No emitimos el clima al siguiente paso, solo actualizamos memoria
+            try:
+                raw = json.loads(message.value)
                 
-            elif topic == 'flights_rt_api':
-                # Enriquecemos el vuelo con el clima que tengamos en memoria
-                airport = payload.get('airport')
-                payload['weather_context'] = WEATHER_STATE.get(airport, "UNKNOWN")
-                yield payload
+                # --- LOGICA PARA API WEATHER (OpenWeather) ---
+                if topic == 'weather_rt_api':
+                    # Parseamos la estructura compleja de OpenWeather
+                    city_name = raw.get('name', 'Unknown')
+                    
+                    # Extraemos condición (está dentro de una lista)
+                    condition = "Unknown"
+                    if 'weather' in raw and len(raw['weather']) > 0:
+                        condition = raw['weather'][0]['main'] # Ej: "Clouds", "Rain"
+                    
+                    # Traducimos Ciudad -> Aeropuerto para poder hacer el Join luego
+                    airport_code = CITY_TO_ICAO.get(city_name, "UNKNOWN")
+                    
+                    if airport_code != "UNKNOWN":
+                        WEATHER_STATE[airport_code] = condition
+                        METRICS["weather_updates"] += 1
+                        print(f"🌤 CLIMA ACTUALIZADO: {airport_code} ({city_name}) -> {condition}")
+
+                # --- LOGICA PARA API FLIGHTS (OpenSky) ---
+                elif topic == 'flights_rt_api':
+                    # Normalizamos el dato de vuelo a nuestro formato interno
+                    # NOTA: Asumimos que NiFi ha calculado el 'delay_calculated'
+                    
+                    flight_data = {
+                        "flight_id": raw.get('callsign', '').strip(), # Quitamos espacios "SWA352 "
+                        "airport": raw.get('estDepartureAirport'),     # Ej: "KATL"
+                        "delay_min": raw.get('delay_calculated', 0),   # Dato inyectado por NiFi
+                        "raw_timestamp": raw.get('firstSeen'),
+                        # Buscamos el clima en memoria (JOIN)
+                        "weather_context": WEATHER_STATE.get(raw.get('estDepartureAirport'), "CLEAR")
+                    }
+                    yield flight_data
+
+            except Exception as e:
+                print(f"⚠️ Error parseando mensaje Kafka: {e}")
 
 class QualityAndKPIs(beam.DoFn):
-    """ Aplica 5 Reglas de Calidad y calcula Riesgo """
     def process(self, data):
         client = MongoClient(MONGO_URI)
         db = client[DB_NAME]
         
         try:
-            # --- VALIDACIÓN: 5 REGLAS DE CALIDAD [Cite: 6.2] ---
+            # --- 5 REGLAS DE CALIDAD [Cite: 6.2] ---
             
-            # 1. Integridad: flight_id obligatorio
-            if not data.get('flight_id'):
-                raise ValueError("Regla 1: Falta flight_id")
-            
-            # 2. Tipo de Dato: delay_min numérico
-            if not isinstance(data.get('delay_min'), (int, float)):
-                raise ValueError("Regla 2: delay_min no es numérico")
+            # Regla 1: Identificador de vuelo obligatorio
+            if not data['flight_id']:
+                raise ValueError("Callsign (flight_id) vacío")
                 
-            # 3. Rango de Negocio: Retraso imposible (>24h o negativo extremo)
-            delay = float(data.get('delay_min'))
-            if delay < -60 or delay > 1440:
-                raise ValueError(f"Regla 3: Retraso fuera de rango lógico ({delay})")
+            # Regla 2: Aeropuerto de origen obligatorio
+            if not data['airport']:
+                raise ValueError("Aeropuerto de origen nulo")
                 
-            # 4. Formato: Aeropuerto IATA (3 letras mayúsculas)
-            airport = data.get('airport', '')
-            if not re.match(r'^[A-Z]{3}$', airport):
-                raise ValueError(f"Regla 4: Código aeropuerto inválido ({airport})")
+            # Regla 3: Retraso numérico
+            if not isinstance(data['delay_min'], (int, float)):
+                raise ValueError("El retraso no es un número válido")
                 
-            # 5. Consistencia Temporal: Fecha válida (simple check)
-            if not data.get('timestamp'):
-                raise ValueError("Regla 5: Falta timestamp")
+            # Regla 4: Formato ICAO (4 letras para aeropuerto)
+            if len(data['airport']) != 4:
+                raise ValueError(f"Código aeropuerto inválido: {data['airport']}")
+                
+            # Regla 5: Coherencia temporal (timestamp existe)
+            if not data['raw_timestamp']:
+                raise ValueError("Falta timestamp (firstSeen)")
 
             # --- CÁLCULO DE KPIs [Cite: 7.1] ---
-            # Aquí usamos el dato de clima que inyectamos en el paso anterior (Join)
-            clima = data.get('weather_context', 'UNKNOWN')
+            delay = float(data['delay_min'])
+            clima = data['weather_context']
             
             nivel_riesgo = "BAJO"
             if delay > 45:
                 nivel_riesgo = "ALTO"
-            elif delay > 15 and clima in ["STORM", "SNOW", "RAIN"]:
+            elif delay > 15 and clima in ["Thunderstorm", "Rain", "Snow"]: # Valores de OpenWeather
                 nivel_riesgo = "ALTO (CLIMA ADVERSO)"
             elif delay > 15:
                 nivel_riesgo = "MEDIO"
 
-            # --- PERSISTENCIA (KPIs) [Cite: 5.3] ---
+            # Documento final para Power BI
             doc_final = {
                 "flight_id": data['flight_id'],
-                "airport": airport,
+                "airport": data['airport'],
                 "delay_min": delay,
-                "weather": clima,
+                "weather_condition": clima,
                 "risk_level": nivel_riesgo,
                 "processed_at": datetime.datetime.now().isoformat()
             }
-            db.realtime_kpis.insert_one(doc_final)
             
+            # Guardamos en REALTIME_KPIS
+            db.realtime_kpis.insert_one(doc_final)
             METRICS["processed"] += 1
             print(f"✅ VUELO: {doc_final['flight_id']} | Clima: {clima} | Riesgo: {nivel_riesgo}")
 
         except ValueError as ve:
-            # --- PERSISTENCIA (Errores de Calidad) ---
-            error_doc = {
-                "raw_data": str(data),
-                "error_msg": str(ve),
-                "timestamp": datetime.datetime.now().isoformat()
-            }
+            # Guardamos en QUALITY_ERRORS [Cite: 6.2]
+            error_doc = {"raw_data": str(data), "error_msg": str(ve), "at": datetime.datetime.now().isoformat()}
             db.quality_errors.insert_one(error_doc)
             METRICS["errors"] += 1
-            print(f"🚫 RECHAZADO: {ve}")
+            print(f"🚫 CALIDAD RECHAZADA: {ve}")
         
         finally:
             client.close()
 
-class MonitorSystem(beam.DoFn):
-    """ Reporta métricas del sistema periódicamente [Cite: 6.1] """
-    def process(self, element):
-        # En una implementación real usaríamos timers. 
-        # Aquí guardamos una foto de las métricas cada vez que pasa un evento "tick".
-        client = MongoClient(MONGO_URI)
-        db = client[DB_NAME]
-        
-        metric_doc = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "total_processed": METRICS["processed"],
-            "total_errors": METRICS["errors"],
-            "weather_updates_received": METRICS["weather_updates"],
-            "status": "HEALTHY"
-        }
-        db.system_metrics.insert_one(metric_doc)
-        client.close()
-
 def run():
-    print("🚀 Iniciando Pipeline FINAL (Join + Quality + Monitoring)...")
     options = PipelineOptions(runner='DirectRunner')
     with beam.Pipeline(options=options) as p:
-        # Flujo principal
-        (
-            p 
-            | 'Inicio' >> beam.Create(['Start'])
-            | 'Leer Multi-Topic' >> beam.ParDo(ReadAndJoinKafka())
-            | 'Calidad y KPIs' >> beam.ParDo(QualityAndKPIs())
-        )
-        
-        # Flujo secundario de Monitorización (Simulado)
-        # En Flink real esto serían métricas nativas. Aquí lo guardamos en Mongo.
-        # (Opcional para no complicar el código, las métricas ya se actualizan arriba)
+        (p | 'Inicio' >> beam.Create(['Start'])
+           | 'Leer y Unir' >> beam.ParDo(ReadAndJoinKafka())
+           | 'KPIs y Calidad' >> beam.ParDo(QualityAndKPIs()))
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
