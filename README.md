@@ -1,5 +1,5 @@
 # Reto Big Data: Meteorología y Retrasos de Vuelos  
-### Arquitectura Lambda – Primera Entrega (11/12)
+### Arquitectura Lambda
 
 Este proyecto forma parte del **Reto Big Data**, cuyo objetivo es analizar la relación entre las condiciones meteorológicas y los retrasos en vuelos comerciales en aeropuertos de Estados Unidos.  
 
